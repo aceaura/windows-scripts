@@ -64,6 +64,54 @@ function Invoke-GitWithTimeout {
     }
 }
 
+# Remove stale remote refs directly from packed-refs when git prune fails.
+# This handles the case where prune returns exit 1 and can't fully clean up.
+function Repair-PackedRefs {
+    param([string]$RepoPath)
+    $packedFile = "$RepoPath\.git\packed-refs"
+    if (!(Test-Path $packedFile)) { return 0 }
+
+    # Get actual remote branches
+    $result = Invoke-GitWithTimeout -RepoPath $RepoPath -GitArgs @("ls-remote", "--heads", "origin") -TimeoutSec 15
+    if (!$result.Success -or $result.ExitCode -ne 0) { return -1 }
+
+    $remoteBranches = @{}
+    foreach ($line in ($result.Output -split "`n")) {
+        if ($line -match "refs/heads/(.+)$") {
+            $remoteBranches[$Matches[1].Trim()] = $true
+        }
+    }
+
+    $lines = [System.IO.File]::ReadAllLines($packedFile)
+    $newLines = [System.Collections.ArrayList]@()
+    $removed = 0
+    $skipNext = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match "refs/remotes/origin/(.+)$") {
+            $branch = $Matches[1].Trim()
+            if ($branch -eq "HEAD" -or $remoteBranches.ContainsKey($branch)) {
+                [void]$newLines.Add($line)
+                $skipNext = $false
+            } else {
+                $removed++
+                $skipNext = $true
+            }
+        } elseif ($line -match "^\^" -and $skipNext) {
+            $removed++
+        } else {
+            [void]$newLines.Add($line)
+            $skipNext = $false
+        }
+    }
+
+    if ($removed -gt 0) {
+        $content = ($newLines -join "`n") + "`n"
+        [System.IO.File]::WriteAllText($packedFile, $content, (New-Object System.Text.UTF8Encoding $false))
+    }
+    return $removed
+}
+
 # Delete a repo and attempt to re-clone it to the same path.
 # $RepoPath: local path, $RemoteUrl: git remote URL (if known)
 # Returns: "cloned" | "clone_failed" | "deleted" (no URL to clone)
@@ -236,10 +284,22 @@ foreach ($h in $httpsHosts) {
         }
         if ($isFake) {
             Write-Warn "$h resolves to $ip (fake/hijacked IP)"
-            # Try to get real IP via public DNS
-            $nslookup = nslookup $h 8.8.8.8 2>&1 | Out-String
-            if ($nslookup -match "Address:\s+([\d\.]+)\s*$" -or $nslookup -match "Addresses:\s+([\d\.]+)") {
-                $realIp = $Matches[1]
+            # Try to get real IPv4 via public DNS (Resolve-DnsName is more reliable than nslookup)
+            $realIp = $null
+            try {
+                $dnsResults = Resolve-DnsName -Name $h -Server 8.8.8.8 -Type A -DnsOnly -ErrorAction Stop
+                $realIp = ($dnsResults | Where-Object { $_.QueryType -eq "A" } | Select-Object -First 1).IPAddress
+            } catch {
+                # Fallback to nslookup if Resolve-DnsName fails
+                $nslookup = nslookup $h 8.8.8.8 2>&1 | Out-String
+                # Match only IPv4 addresses (x.x.x.x), skip IPv6
+                $ipv4Matches = [regex]::Matches($nslookup, "Address:\s+((\d{1,3}\.){3}\d{1,3})")
+                # Take the last match (first is usually the DNS server itself)
+                if ($ipv4Matches.Count -gt 0) {
+                    $realIp = $ipv4Matches[$ipv4Matches.Count - 1].Groups[1].Value
+                }
+            }
+            if ($realIp -and $realIp -match "^(\d{1,3}\.){3}\d{1,3}$") {
                 # Verify it's not also fake
                 $stillFake = $false
                 foreach ($prefix in $fakeRanges) {
@@ -253,10 +313,10 @@ foreach ($h in $httpsHosts) {
                         $dnsFixed += $h
                     }
                 } else {
-                    Write-Err "Could not get real IP for $h from Google DNS"
+                    Write-Err "Could not get real IPv4 for $h from Google DNS"
                 }
             } else {
-                Write-Err "nslookup via 8.8.8.8 failed for $h"
+                Write-Err "No valid IPv4 found for $h via Google DNS (got: $realIp)"
             }
         } else {
             Write-Ok "$h -> $ip (looks real)"
@@ -281,9 +341,20 @@ $repos = [System.Collections.ArrayList]@()
 foreach ($g in $allGitDirs) {
     $repoPath = $g.Parent.FullName
     if ($repoPath -match '\$RECYCLE\.BIN') { continue }
+    # Skip submodule worktrees: .git/modules/*/config exists but no HEAD at top level
+    # Or: parent dir has a .gitmodules that references this path
     $isChild = $false
     foreach ($existing in $repos) {
-        if ($repoPath.StartsWith("$existing\")) { $isChild = $true; break }
+        if ($repoPath.StartsWith("$existing\")) {
+            # It's under an existing repo — check if it's a submodule
+            $gitmodulesPath = Join-Path $existing ".gitmodules"
+            if (Test-Path $gitmodulesPath) {
+                # This is likely a submodule of $existing, skip it
+                $isChild = $true; break
+            }
+            # Even without .gitmodules, it's a nested repo — skip
+            $isChild = $true; break
+        }
     }
     if (!$isChild) { [void]$repos.Add($repoPath) }
 }
@@ -410,6 +481,8 @@ if ($SkipNetwork) {
         $netSkipped = 0
         $deadRepos = [System.Collections.ArrayList]@()
         $failedRepos = [System.Collections.ArrayList]@()
+        $timeoutRepos = [System.Collections.ArrayList]@()
+        $skippedRepos = [System.Collections.ArrayList]@()
         $domainTimeouts = @{}
 
         for ($i = 0; $i -lt $repos.Count; $i++) {
@@ -429,6 +502,7 @@ if ($SkipNetwork) {
                 Write-Host "  [$idx/$($repos.Count)] $name" -ForegroundColor DarkGray -NoNewline
                 Write-Host " -> skipped ($domain unreachable)" -ForegroundColor DarkGray
                 $netSkipped++
+                [void]$skippedRepos.Add(@{ Path = $repo; Url = $remote; Domain = $domain; Reason = "domain unreachable: $domain" })
                 continue
             }
 
@@ -446,13 +520,25 @@ if ($SkipNetwork) {
                 }
             }
 
-            # --- Prune ---
+            # --- Prune (with lock cleanup + retry) ---
+            # Clean stale lock files before prune to avoid "cannot lock ref" errors
+            Get-ChildItem -Path "$repo\.git\refs" -Filter "*.lock" -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+
             $pruneResult = Invoke-GitWithTimeout -RepoPath $repo -GitArgs @("remote", "prune", "origin") -TimeoutSec $netTimeoutSec
+
+            # If prune failed due to lock files (concurrent git), clean and retry once
+            if ($pruneResult.Success -and $pruneResult.Output -match "cannot lock ref") {
+                Get-ChildItem -Path "$repo\.git\refs" -Filter "*.lock" -Recurse -Force -ErrorAction SilentlyContinue |
+                    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                $pruneResult = Invoke-GitWithTimeout -RepoPath $repo -GitArgs @("remote", "prune", "origin") -TimeoutSec $netTimeoutSec
+            }
 
             if (!$pruneResult.Success) {
                 # Prune timed out
                 Write-Host " -> timeout (prune)" -ForegroundColor Yellow
                 $netTimeoutCount++
+                [void]$timeoutRepos.Add(@{ Path = $repo; Url = $remote; Domain = $domain; Reason = "timeout (prune)" })
                 Add-DomainTimeout
                 continue
             }
@@ -467,17 +553,27 @@ if ($SkipNetwork) {
                 continue
             }
 
-            # Prune failed (non-zero exit) but not dead — record as failed
-            if ($pruneResult.ExitCode -ne 0) {
+            # Prune with non-zero exit: git returns exit 1 when branches were pruned (known behavior)
+            # Only treat as real failure if output contains fatal/error AND no pruned branches
+            $wasPruned = $pruneOut -match "\[pruned\]"
+            $hasFatal = $pruneOut -match "fatal:|error:"
+            if ($pruneResult.ExitCode -ne 0 -and !$wasPruned -and $hasFatal) {
                 Write-Host " -> failed (prune)" -ForegroundColor Red
                 [void]$failedRepos.Add(@{ Path = $repo; Url = $remote; Error = $pruneOut.Trim() })
                 $netFailed++
                 continue
             }
 
-            # Prune succeeded — reset timeout counter
+            # Prune succeeded (or pruned branches) — reset timeout counter
             if ($domain -ne "") { $domainTimeouts[$domain] = 0 }
-            $wasPruned = $pruneOut -match "pruned"
+
+            # If prune had exit code 1 (partial cleanup), repair packed-refs directly
+            if ($pruneResult.ExitCode -ne 0 -or $wasPruned) {
+                $repaired = Repair-PackedRefs -RepoPath $repo
+                if ($repaired -gt 0) {
+                    $wasPruned = $true
+                }
+            }
 
             # --- Fetch dry-run ---
             $fetchResult = Invoke-GitWithTimeout -RepoPath $repo -GitArgs @("fetch", "--dry-run") -TimeoutSec $netTimeoutSec
@@ -488,6 +584,7 @@ if ($SkipNetwork) {
                 Write-Host " -> ${suffix}timeout (fetch)" -ForegroundColor Yellow
                 if ($wasPruned) { $netPruned++ }
                 $netTimeoutCount++
+                [void]$timeoutRepos.Add(@{ Path = $repo; Url = $remote; Domain = $domain; Reason = "timeout (fetch)" })
                 Add-DomainTimeout
                 continue
             }
@@ -501,8 +598,9 @@ if ($SkipNetwork) {
                 continue
             }
 
-            # Fetch failed (non-zero exit) but not dead
-            if ($fetchResult.ExitCode -ne 0) {
+            # Fetch failed (non-zero exit) but not dead — only fail if truly broken
+            $fetchHasFatal = $fetchOut -match "fatal:|error:"
+            if ($fetchResult.ExitCode -ne 0 -and $fetchHasFatal) {
                 $suffix = if ($wasPruned) { "pruned, " } else { "" }
                 Write-Host " -> ${suffix}failed (fetch)" -ForegroundColor Red
                 if ($wasPruned) { $netPruned++ }
@@ -524,7 +622,7 @@ if ($SkipNetwork) {
         Write-Host ""
         Write-Host "  Results: OK=$netOk  Pruned=$netPruned  Failed=$netFailed  Timeout=$netTimeoutCount  Skipped=$netSkipped  Dead=$netDead" -ForegroundColor White
 
-        # Merge dead + failed into one cleanup list (exclude timeout/network issues)
+        # --- Handle dead + failed repos (delete & re-clone) ---
         $cleanupRepos = [System.Collections.ArrayList]@()
         foreach ($r in $deadRepos) {
             [void]$cleanupRepos.Add(@{ Path = $r.Path; Url = $r.Url; Reason = "dead remote" })
@@ -562,6 +660,89 @@ if ($SkipNetwork) {
                 Write-Info "Skipped"
             }
         }
+
+        # --- Handle timeout + skipped repos (retry or delete & re-clone) ---
+        $needsRetry = [System.Collections.ArrayList]@()
+        foreach ($r in $timeoutRepos) { [void]$needsRetry.Add($r) }
+        foreach ($r in $skippedRepos) { [void]$needsRetry.Add($r) }
+
+        if ($needsRetry.Count -gt 0) {
+            Write-Host ""
+            Write-Warn "Repos that timed out or were skipped ($($needsRetry.Count)):"
+            foreach ($r in $needsRetry) {
+                $name = $r.Path.Replace($root, "")
+                Write-Err "  $name ($($r.Reason))"
+            }
+
+            $choice = Confirm-Choice "How to handle timeout/skipped repos?" @(
+                "Retry with 120s timeout",
+                "Delete and re-clone all",
+                "Confirm each",
+                "Skip"
+            )
+            if ($choice -eq 0) {
+                # Retry with much longer timeout
+                foreach ($r in $needsRetry) {
+                    $name = $r.Path.Replace($root, "")
+                    Write-Host "  Retrying: $name (120s) ..." -ForegroundColor Gray -NoNewline
+                    $retry = Invoke-GitWithTimeout -RepoPath $r.Path -GitArgs @("fetch", "--prune") -TimeoutSec 120
+                    if ($retry.Success -and ($retry.ExitCode -eq 0 -or $retry.Output -match "\[pruned\]")) {
+                        Write-Host " ok" -ForegroundColor Green
+                    } elseif (!$retry.Success) {
+                        Write-Host " still timeout" -ForegroundColor Red
+                        Write-Warn "  Network issue — kept as-is (not a repo error)"
+                    } else {
+                        Write-Host " failed" -ForegroundColor Red
+                        $errLine = ($retry.Output -split "`n" | Where-Object { $_ -match "\S" } | Select-Object -Last 1)
+                        Write-Err "  $errLine"
+                        if (Confirm-Action "  Delete and re-clone $name ?" $true) {
+                            Remove-AndReclone -RepoPath $r.Path -RemoteUrl $r.Url
+                        } else {
+                            Write-Info "  Kept: $name"
+                        }
+                    }
+                }
+            }
+            elseif ($choice -eq 1) {
+                foreach ($r in $needsRetry) {
+                    Remove-AndReclone -RepoPath $r.Path -RemoteUrl $r.Url
+                }
+            }
+            elseif ($choice -eq 2) {
+                foreach ($r in $needsRetry) {
+                    $name = $r.Path.Replace($root, "")
+                    $urlHint = if ($r.Url) { " -> $($r.Url)" } else { "" }
+                    $action = Confirm-Choice "$name ($($r.Reason))${urlHint}" @(
+                        "Retry (120s timeout)",
+                        "Delete and re-clone",
+                        "Skip (keep as-is)"
+                    )
+                    if ($action -eq 0) {
+                        Write-Host "  Retrying (120s) ..." -ForegroundColor Gray -NoNewline
+                        $retry = Invoke-GitWithTimeout -RepoPath $r.Path -GitArgs @("fetch", "--prune") -TimeoutSec 120
+                        if ($retry.Success -and ($retry.ExitCode -eq 0 -or $retry.Output -match "\[pruned\]")) {
+                            Write-Host " ok" -ForegroundColor Green
+                        } else {
+                            Write-Host " failed" -ForegroundColor Red
+                            if (Confirm-Action "  Delete and re-clone instead?" $true) {
+                                Remove-AndReclone -RepoPath $r.Path -RemoteUrl $r.Url
+                            } else {
+                                Write-Info "  Kept: $name"
+                            }
+                        }
+                    }
+                    elseif ($action -eq 1) {
+                        Remove-AndReclone -RepoPath $r.Path -RemoteUrl $r.Url
+                    }
+                    else {
+                        Write-Info "  Kept: $name"
+                    }
+                }
+            }
+            else {
+                Write-Info "Skipped"
+            }
+        }
     }
 }
 
@@ -578,17 +759,176 @@ if ($subRepos.Count -eq 0) {
     foreach ($r in $subRepos) { Write-Info $r }
 
     if (Confirm-Action "Sync submodules? (git submodule update --init --recursive --force)") {
+        $subOk = 0
+        $subFailed = [System.Collections.ArrayList]@()
+
         foreach ($r in $subRepos) {
             $name = $r.Replace($root, "")
             Write-Host "  Syncing: $name ..." -ForegroundColor Gray -NoNewline
-            git -C $r submodule update --init --recursive --force 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+
+            # Use Invoke-GitWithTimeout with generous timeout (submodules can be slow)
+            $subResult = Invoke-GitWithTimeout -RepoPath $r -GitArgs @("submodule", "update", "--init", "--recursive", "--force") -TimeoutSec 120
+
+            if ($subResult.Success -and $subResult.ExitCode -eq 0) {
                 Write-Host " ok" -ForegroundColor Green
+                $subOk++
+            } elseif (!$subResult.Success) {
+                Write-Host " timeout (120s)" -ForegroundColor Red
+                [void]$subFailed.Add(@{ Path = $r; Error = "timeout after 120s"; Name = $name })
             } else {
+                # Capture error details
+                $errLines = ($subResult.Output -split "`n" | Where-Object { $_ -match "fatal:|error:|Failed" })
+                $errMsg = if ($errLines) { ($errLines | Select-Object -First 3) -join "; " } else { "exit code $($subResult.ExitCode)" }
                 Write-Host " failed" -ForegroundColor Red
+                Write-Err "    $errMsg"
+                [void]$subFailed.Add(@{ Path = $r; Error = $errMsg; Name = $name })
+            }
+        }
+
+        Write-Host ""
+        Write-Host "  Submodule results: OK=$subOk  Failed=$($subFailed.Count)" -ForegroundColor White
+
+        if ($subFailed.Count -gt 0) {
+            Write-Warn "Failed submodule syncs ($($subFailed.Count)):"
+            foreach ($f in $subFailed) {
+                Write-Err "  $($f.Name)"
+                Write-Info "    Error: $($f.Error)"
+            }
+
+            $choice = Confirm-Choice "How to handle failed submodule repos?" @(
+                "Retry each with longer timeout (300s)",
+                "Delete and re-clone parent repos",
+                "Confirm each",
+                "Skip"
+            )
+            if ($choice -eq 0) {
+                foreach ($f in $subFailed) {
+                    Write-Host "  Retrying: $($f.Name) (300s) ..." -ForegroundColor Gray -NoNewline
+                    # First clean lock files in submodules
+                    Get-ChildItem -Path "$($f.Path)\.git\modules" -Filter "*.lock" -Recurse -Force -ErrorAction SilentlyContinue |
+                        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                    $retry = Invoke-GitWithTimeout -RepoPath $f.Path -GitArgs @("submodule", "update", "--init", "--recursive", "--force") -TimeoutSec 300
+                    if ($retry.Success -and $retry.ExitCode -eq 0) {
+                        Write-Host " ok" -ForegroundColor Green
+                    } elseif (!$retry.Success) {
+                        Write-Host " still timeout" -ForegroundColor Red
+                        Write-Warn "  Network issue — kept as-is"
+                    } else {
+                        Write-Host " still failed" -ForegroundColor Red
+                        $errLine = ($retry.Output -split "`n" | Where-Object { $_ -match "fatal:|error:" } | Select-Object -First 1)
+                        Write-Err "    $errLine"
+                        $url = git -C $f.Path remote get-url origin 2>$null
+                        if (Confirm-Action "  Delete and re-clone $($f.Name) ?" $true) {
+                            Remove-AndReclone -RepoPath $f.Path -RemoteUrl $url
+                        } else {
+                            Write-Info "  Kept: $($f.Name)"
+                        }
+                    }
+                }
+            }
+            elseif ($choice -eq 1) {
+                foreach ($f in $subFailed) {
+                    $url = git -C $f.Path remote get-url origin 2>$null
+                    Remove-AndReclone -RepoPath $f.Path -RemoteUrl $url
+                }
+            }
+            elseif ($choice -eq 2) {
+                foreach ($f in $subFailed) {
+                    $url = git -C $f.Path remote get-url origin 2>$null
+                    $urlHint = if ($url) { " -> $url" } else { "" }
+                    $action = Confirm-Choice "$($f.Name)${urlHint}" @(
+                        "Retry (300s timeout)",
+                        "Delete and re-clone",
+                        "Skip (keep as-is)"
+                    )
+                    if ($action -eq 0) {
+                        Write-Host "  Retrying (300s) ..." -ForegroundColor Gray -NoNewline
+                        Get-ChildItem -Path "$($f.Path)\.git\modules" -Filter "*.lock" -Recurse -Force -ErrorAction SilentlyContinue |
+                            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                        $retry = Invoke-GitWithTimeout -RepoPath $f.Path -GitArgs @("submodule", "update", "--init", "--recursive", "--force") -TimeoutSec 300
+                        if ($retry.Success -and $retry.ExitCode -eq 0) {
+                            Write-Host " ok" -ForegroundColor Green
+                        } else {
+                            Write-Host " failed" -ForegroundColor Red
+                            if (Confirm-Action "  Delete and re-clone instead?" $true) {
+                                Remove-AndReclone -RepoPath $f.Path -RemoteUrl $url
+                            } else {
+                                Write-Info "  Kept: $($f.Name)"
+                            }
+                        }
+                    }
+                    elseif ($action -eq 1) {
+                        Remove-AndReclone -RepoPath $f.Path -RemoteUrl $url
+                    }
+                    else {
+                        Write-Info "  Kept: $($f.Name)"
+                    }
+                }
+            }
+            else {
+                Write-Info "Skipped"
             }
         }
     }
+}
+
+# ============================================================
+# STEP 6: Final verification sweep
+# ============================================================
+Write-Step "STEP 6: Final verification"
+
+$remainingRepos = @($repos | Where-Object { Test-Path $_ })
+Write-Info "Checking $($remainingRepos.Count) remaining repos..."
+
+$verifyOk = 0
+$verifyBroken = [System.Collections.ArrayList]@()
+
+foreach ($repo in $remainingRepos) {
+    $name = $repo.Replace($root, "")
+    # Quick health check: git status + verify HEAD
+    $statusOut = git -C $repo status --short 2>&1 | Out-String
+    $headOk = git -C $repo rev-parse HEAD 2>$null
+    if ($statusOut -match "fatal:" -or [string]::IsNullOrWhiteSpace($headOk)) {
+        $errLine = ($statusOut -split "`n" | Where-Object { $_ -match "fatal:" } | Select-Object -First 1)
+        [void]$verifyBroken.Add(@{ Path = $repo; Name = $name; Error = $errLine })
+    } else {
+        $verifyOk++
+    }
+}
+
+Write-Host ""
+Write-Host "  Final: OK=$verifyOk  Broken=$($verifyBroken.Count) / $($remainingRepos.Count) total" -ForegroundColor White
+
+if ($verifyBroken.Count -gt 0) {
+    Write-Warn "Still broken after all repairs ($($verifyBroken.Count)):"
+    foreach ($b in $verifyBroken) {
+        Write-Err "  $($b.Name)"
+        if ($b.Error) { Write-Info "    $($b.Error)" }
+    }
+
+    $choice = Confirm-Choice "Last resort — delete and re-clone broken repos?" @("Delete and re-clone all", "Confirm each", "Skip")
+    if ($choice -eq 0) {
+        foreach ($b in $verifyBroken) {
+            $url = git -C $b.Path remote get-url origin 2>$null
+            Remove-AndReclone -RepoPath $b.Path -RemoteUrl $url
+        }
+    }
+    elseif ($choice -eq 1) {
+        foreach ($b in $verifyBroken) {
+            $url = git -C $b.Path remote get-url origin 2>$null
+            $urlHint = if ($url) { " -> $url" } else { "" }
+            if (Confirm-Action "Delete and re-clone $($b.Name)${urlHint} ?" $false) {
+                Remove-AndReclone -RepoPath $b.Path -RemoteUrl $url
+            } else {
+                Write-Info "  Kept: $($b.Name)"
+            }
+        }
+    }
+    else {
+        Write-Info "Skipped"
+    }
+} else {
+    Write-Ok "All $verifyOk repos are healthy!"
 }
 
 # ============================================================
