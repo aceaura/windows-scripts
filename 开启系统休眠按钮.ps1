@@ -1,4 +1,4 @@
-powercfg /hibernate on
+﻿powercfg /hibernate on
 Write-Host "休眠功能已启用" -ForegroundColor Green
 
 # 修改注册表显示休眠按钮
