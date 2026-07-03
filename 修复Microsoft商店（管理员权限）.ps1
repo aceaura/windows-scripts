@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 # ============================================================
 # 修复Microsoft商店
 # 适用场景：商店能打开但一直加载/无法连接（使用本地代理时常见）
@@ -20,6 +20,10 @@ if ($proxyEnable -eq 1 -and $proxyServer -match "127\.0\.0\.1|localhost") {
     Write-Host "未检测到本地代理，将执行通用修复（缓存清理+重新注册）。" -ForegroundColor Yellow
 }
 
+# ---- 显示当前loopback豁免列表 ----
+Write-Host "`n当前loopback豁免列表:" -ForegroundColor Cyan
+CheckNetIsolation LoopbackExempt -c
+
 # ---- 待添加loopback豁免的UWP应用包 ----
 $pfns = @(
     "Microsoft.WindowsStore_8wekyb3d8bbwe",
@@ -27,7 +31,9 @@ $pfns = @(
     "Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy",
     "Microsoft.AccountsControl_cw5n1h2txyewy",
     "Microsoft.WindowsMaps_8wekyb3d8bbwe",
-    "Microsoft.BingWeather_8wekyb3d8bbwe"
+    "Microsoft.BingWeather_8wekyb3d8bbwe",
+    "Microsoft.MicrosoftEdge_8wekyb3d8bbwe",
+    "Microsoft.Win32WebViewHost_cw5n1h2txyewy"
 )
 
 # ---- 添加loopback豁免 ----
@@ -43,6 +49,10 @@ foreach ($pfn in $pfns) {
     }
 }
 Write-Host "共添加 $added 个应用的loopback豁免" -ForegroundColor Green
+
+# ---- 显示添加后的豁免列表 ----
+Write-Host "`n添加后loopback豁免列表:" -ForegroundColor Cyan
+CheckNetIsolation LoopbackExempt -c
 
 # ---- 清理商店缓存 ----
 Write-Host "`n清理Microsoft商店缓存..." -ForegroundColor Cyan
@@ -84,7 +94,8 @@ if ($store) {
 # ---- 关闭并重启商店 ----
 Write-Host "`n重启Microsoft商店..." -ForegroundColor Cyan
 Get-Process | Where-Object { $_.PackageFamilyName -eq "Microsoft.WindowsStore_8wekyb3d8bbwe" } | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
+Get-Process RuntimeBroker -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 3
 Start-Process "winstore:"
 
 # ---- 完成 ----
